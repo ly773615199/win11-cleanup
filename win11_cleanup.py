@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Windows 11 垃圾清理工具 v2.0 - 独立可执行版
-支持 C盘 + D盘 全面清理
+Windows 11 垃圾清理工具 v2.1 - 独立可执行版
+支持 C盘 + D盘 全面清理，含浏览器缓存、日志记录、安全防护
 """
 
 import os
@@ -11,9 +11,23 @@ import ctypes
 import subprocess
 import time
 import tempfile
+import logging
+import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
+from collections import defaultdict
+
+# ─── 日志配置 ────────────────────────────────────────────
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cleanup.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("cleanup")
 
 # ─── 跨平台检测 ─────────────────────────────────────────
 IS_WINDOWS = sys.platform == "win32"
@@ -31,29 +45,55 @@ class Colors:
     GRAY = "\033[90m"
     WHITE = "\033[97m"
 
-def colored(text, color):
+def colored(text: str, color: str) -> str:
     return f"{color}{text}{Colors.RESET}"
 
-def print_colored(text, color=Colors.WHITE):
+def print_colored(text: str, color: str = Colors.WHITE) -> None:
     print(colored(text, color))
 
-def banner():
+def banner() -> None:
     print()
     print_colored("╔══════════════════════════════════════════════════════════╗", Colors.CYAN)
-    print_colored("║         🧹  Windows 11 垃圾清理工具  v2.0              ║", Colors.CYAN)
-    print_colored("║            单文件独立版 — 无需安装依赖                  ║", Colors.CYAN)
+    print_colored("║         🧹  Windows 11 垃圾清理工具  v2.1              ║", Colors.CYAN)
+    print_colored("║        单文件独立版 — 安全清理 · 日志可溯              ║", Colors.CYAN)
     print_colored("╚══════════════════════════════════════════════════════════╝", Colors.CYAN)
+
+# ─── 安全路径白名单 ─────────────────────────────────────
+# 只允许清理以下前缀的路径，防止误删系统关键文件
+SAFE_PREFIXES = [
+    "temp", "tmp", "cache", "log", "logs",
+    "recycle", "prefetch", "thumbcache",
+    "crashdumps", "wer", "d3dscache",
+    "shader", "deliveryoptimization",
+    "software distribution", "inetcache",
+    "recent", "nvidia", "backups",
+]
+
+def is_safe_path(path: str) -> bool:
+    """检查路径是否在安全白名单内"""
+    lower = path.lower()
+    # 危险路径黑名单
+    dangerous = [
+        "windows\\system32", "windows\\syswow64",
+        "program files", "programdata\\microsoft\\windows\\start menu",
+        "$windows.~bt", "bootmgr", "bootnxt",
+        "pagefile.sys", "hiberfil.sys", "swapfile.sys",
+    ]
+    for d in dangerous:
+        if d in lower:
+            return False
+    return True
 
 # ─── 工具函数 ────────────────────────────────────────────
 
-def size_str(n):
+def size_str(n: float) -> str:
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if n < 1024:
             return f"{n:.2f} {unit}"
         n /= 1024
     return f"{n:.2f} PB"
 
-def folder_size(path):
+def folder_size(path: str) -> int:
     """计算目录大小（bytes），跳过无法访问的文件"""
     total = 0
     try:
@@ -66,71 +106,108 @@ def folder_size(path):
             try:
                 if f.is_file():
                     total += f.stat().st_size
-            except (PermissionError, OSError):
+            except (PermissionError, OSError) as e:
+                log.debug("无法访问 %s: %s", f, e)
                 continue
-    except (PermissionError, OSError):
-        pass
+    except (PermissionError, OSError) as e:
+        log.warning("无法扫描目录 %s: %s", path, e)
     return total
 
-def drive_free_space(drive):
+def file_hash(filepath: str, algorithm: str = "md5") -> Optional[str]:
+    """计算文件哈希值，用于精确去重"""
+    try:
+        h = hashlib.new(algorithm)
+        with open(filepath, "rb") as f:
+            while chunk := f.read(8192):
+                h.update(chunk)
+        return h.hexdigest()
+    except (PermissionError, OSError, ValueError):
+        return None
+
+def drive_free_space(drive: str) -> int:
     """获取磁盘剩余空间"""
     if not IS_WINDOWS:
-        stat = shutil.disk_usage("/") if drive == "C" else None
-        if drive == "D":
+        if drive == "C":
             try:
-                stat = shutil.disk_usage("/tmp")  # 模拟
-            except:
+                return shutil.disk_usage("/").free
+            except OSError:
                 return -1
-        return stat.free if stat else -1
-    
+        elif drive == "D":
+            try:
+                return shutil.disk_usage("/tmp").free
+            except OSError:
+                return -1
+        return -1
     try:
         _, _, free = shutil.disk_usage(f"{drive}:\\")
         return free
-    except:
+    except OSError as e:
+        log.debug("无法获取 %s 盘空间: %s", drive, e)
         return -1
 
-def is_admin():
+def is_admin() -> bool:
     """检查管理员权限"""
     if not IS_WINDOWS:
         return os.geteuid() == 0
     try:
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except:
+    except (AttributeError, OSError):
         return False
 
-def get_temp_dir():
+def get_temp_dir() -> str:
     if IS_WINDOWS:
         return os.environ.get("TEMP", os.environ.get("TMP", r"C:\Windows\Temp"))
     return tempfile.gettempdir()
 
-def get_local_appdata():
+def get_local_appdata() -> str:
     if IS_WINDOWS:
         return os.environ.get("LOCALAPPDATA", "")
     return os.path.expanduser("~/.local/share")
 
-def get_appdata():
+def get_appdata() -> str:
     if IS_WINDOWS:
         return os.environ.get("APPDATA", "")
     return os.path.expanduser("~/.config")
+
+def get_user_profile() -> str:
+    if IS_WINDOWS:
+        return os.environ.get("USERPROFILE", "")
+    return os.path.expanduser("~")
+
+def progress_bar(current: int, total: int, width: int = 30) -> str:
+    """生成文本进度条"""
+    if total == 0:
+        return "[" + "·" * width + "]"
+    filled = int(width * current / total)
+    bar = "█" * filled + "·" * (width - filled)
+    return f"[{bar}] {current}/{total}"
 
 # ─── 核心清理引擎 ────────────────────────────────────────
 
 class CleanupEngine:
     def __init__(self):
-        self.total_cleaned = 0
-        self.total_files = 0
-        self.errors = 0
-        self.results = []  # {name, path, size, drive, status}
+        self.total_cleaned: int = 0
+        self.total_files: int = 0
+        self.errors: int = 0
+        self.results: list[dict] = []
+        self.deleted_log: list[str] = []  # 记录所有删除的文件路径
     
-    def clean_folder(self, path, filter_ext=None):
+    def clean_folder(self, path: str, filter_ext: Optional[list[str]] = None) -> int:
         """清理目录内容，返回清理的字节数"""
+        if not is_safe_path(path):
+            log.warning("路径未通过安全检查，跳过: %s", path)
+            return 0
+        
         cleaned = 0
         p = Path(path)
         if not p.exists():
             return 0
         
         try:
-            for item in p.rglob("*"):
+            items = list(p.rglob("*"))
+            total = len(items)
+            
+            for idx, item in enumerate(items):
                 try:
                     if filter_ext and item.is_file() and item.suffix.lower() not in filter_ext:
                         continue
@@ -139,29 +216,37 @@ class CleanupEngine:
                         item.unlink(missing_ok=True)
                         cleaned += size
                         self.total_files += 1
+                        self.deleted_log.append(str(item))
+                        log.info("已删除: %s (%s)", item, size_str(size))
                     elif item.is_dir():
                         try:
-                            item.rmdir()  # 只删空目录
-                        except:
-                            pass
-                except (PermissionError, OSError):
+                            item.rmdir()
+                        except OSError:
+                            pass  # 非空目录，跳过
+                except (PermissionError, OSError) as e:
                     self.errors += 1
+                    log.warning("删除失败: %s - %s", item, e)
                     continue
             
-            # 再次尝试清理空目录
+            # 再次尝试清理空目录（从深层到浅层）
             for item in sorted(p.rglob("*"), key=lambda x: len(str(x)), reverse=True):
                 if item.is_dir():
                     try:
                         item.rmdir()
-                    except:
+                    except OSError:
                         pass
-        except (PermissionError, OSError):
+        except (PermissionError, OSError) as e:
             self.errors += 1
+            log.error("清理目录失败 %s: %s", path, e)
         
         return cleaned
     
-    def clean_pattern(self, base_path, pattern):
+    def clean_pattern(self, base_path: str, pattern: str) -> int:
         """清理匹配模式的文件"""
+        if not is_safe_path(base_path):
+            log.warning("路径未通过安全检查，跳过: %s", base_path)
+            return 0
+        
         cleaned = 0
         p = Path(base_path)
         if not p.exists():
@@ -175,16 +260,23 @@ class CleanupEngine:
                         item.unlink(missing_ok=True)
                         cleaned += size
                         self.total_files += 1
-                except (PermissionError, OSError):
+                        self.deleted_log.append(str(item))
+                        log.info("已删除 (模式匹配): %s", item)
+                except (PermissionError, OSError) as e:
                     self.errors += 1
+                    log.warning("删除失败: %s - %s", item, e)
                     continue
-        except (PermissionError, OSError):
-            pass
+        except (PermissionError, OSError) as e:
+            log.error("模式扫描失败 %s/%s: %s", base_path, pattern, e)
         
         return cleaned
     
-    def clean_old_files(self, base_path, patterns, days=30):
+    def clean_old_files(self, base_path: str, patterns: list[str], days: int = 30) -> int:
         """清理指定天数以上的文件"""
+        if not is_safe_path(base_path):
+            log.warning("路径未通过安全检查，跳过: %s", base_path)
+            return 0
+        
         cleaned = 0
         p = Path(base_path)
         if not p.exists():
@@ -203,23 +295,108 @@ class CleanupEngine:
                                 item.unlink(missing_ok=True)
                                 cleaned += size
                                 self.total_files += 1
-                    except (PermissionError, OSError):
+                                self.deleted_log.append(str(item))
+                                log.info("已删除 (旧文件 %d天+): %s", days, item)
+                    except (PermissionError, OSError) as e:
                         self.errors += 1
+                        log.warning("删除失败: %s - %s", item, e)
                         continue
-            except (PermissionError, OSError):
-                pass
+            except (PermissionError, OSError) as e:
+                log.error("旧文件扫描失败 %s/%s: %s", base_path, pattern, e)
         
         return cleaned
     
-    def add_result(self, name, path, size, drive, status="found"):
+    def add_result(self, name: str, path: str, size: int, drive: str, status: str = "found") -> None:
         self.results.append({
             "name": name, "path": path, "size": size,
             "drive": drive, "status": status
         })
 
+# ─── 浏览器缓存清理 (新增) ──────────────────────────────
+
+def scan_browser_cache(engine: CleanupEngine) -> None:
+    """扫描浏览器缓存（Chrome / Edge / Firefox）"""
+    local_appdata = get_local_appdata()
+    user_profile = get_user_profile()
+    
+    browsers = []
+    
+    if IS_WINDOWS:
+        browsers = [
+            ("Chrome 缓存", os.path.join(local_appdata, r"Google\Chrome\User Data\Default\Cache\Cache_Data")),
+            ("Chrome Service Worker", os.path.join(local_appdata, r"Google\Chrome\User Data\Default\Service Worker\CacheStorage")),
+            ("Edge 缓存", os.path.join(local_appdata, r"Microsoft\Edge\User Data\Default\Cache\Cache_Data")),
+            ("Edge Service Worker", os.path.join(local_appdata, r"Microsoft\Edge\User Data\Default\Service Worker\CacheStorage")),
+            ("Firefox 缓存", os.path.join(local_appdata, r"Mozilla\Firefox\Profiles")),
+        ]
+    else:
+        browsers = [
+            ("Chrome 缓存", os.path.join(user_profile, ".cache/google-chrome/Default/Cache")),
+            ("Firefox 缓存", os.path.join(user_profile, ".cache/mozilla/firefox")),
+        ]
+    
+    print_colored("  🌐 [浏览器] 扫描中...", Colors.YELLOW)
+    
+    for name, path in browsers:
+        if not path:
+            continue
+        # Firefox Profiles 是多层目录，特殊处理
+        if "Firefox" in name and "Profiles" in path:
+            if os.path.isdir(path):
+                total_size = 0
+                try:
+                    for profile in Path(path).iterdir():
+                        if profile.is_dir():
+                            cache_dir = profile / "cache2" / "entries"
+                            if cache_dir.exists():
+                                total_size += folder_size(str(cache_dir))
+                            # 也清理 startupCache
+                            startup = profile / "startupCache"
+                            if startup.exists():
+                                total_size += folder_size(str(startup))
+                except OSError:
+                    pass
+                if total_size > 0:
+                    engine.add_result(name, path, total_size, "C")
+                    print_colored(f"    ✓ {name}: {size_str(total_size)}", Colors.GRAY)
+            continue
+        
+        size = folder_size(path)
+        if size > 0:
+            engine.add_result(name, path, size, "C")
+            print_colored(f"    ✓ {name}: {size_str(size)}", Colors.GRAY)
+
+def clean_browser_cache(engine: CleanupEngine, items: list[dict]) -> None:
+    """清理浏览器缓存"""
+    for item in items:
+        name = item["name"]
+        path = item["path"]
+        
+        print_colored(f"    🧹 {name}...", Colors.YELLOW)
+        log.info("开始清理浏览器缓存: %s", name)
+        
+        if "Firefox" in name and "Profiles" in path:
+            # Firefox 特殊处理
+            cleaned = 0
+            try:
+                for profile in Path(path).iterdir():
+                    if profile.is_dir():
+                        for subdir in ["cache2/entries", "startupCache"]:
+                            sp = profile / subdir
+                            if sp.exists():
+                                cleaned += engine.clean_folder(str(sp))
+            except OSError as e:
+                log.warning("Firefox 缓存清理失败: %s", e)
+        else:
+            cleaned = engine.clean_folder(path)
+        
+        engine.total_cleaned += cleaned
+        item["status"] = "done"
+        item["cleaned"] = cleaned
+
 # ─── C盘清理项 ──────────────────────────────────────────
 
-def scan_c_drive(engine):
+def scan_c_drive(engine: CleanupEngine) -> None:
     """扫描C盘可清理项"""
     local_appdata = get_local_appdata()
     appdata = get_appdata()
@@ -247,7 +424,6 @@ def scan_c_drive(engine):
             ("DirectX ShaderCache 2", os.path.join(local_appdata, r"Microsoft\DirectX Shader Cache")),
         ]
     else:
-        # Linux 测试模式 - 使用模拟路径
         home = os.path.expanduser("~")
         c_items = [
             ("[测试] /tmp 内容", "/tmp"),
@@ -265,32 +441,50 @@ def scan_c_drive(engine):
             engine.add_result(name, path, size, "C")
             print_colored(f"    ✓ {name}: {size_str(size)}", Colors.GRAY)
 
-def clean_c_drive(engine, items):
+def clean_c_drive(engine: CleanupEngine, items: list[dict]) -> None:
     """执行C盘清理"""
     for item in items:
         name = item["name"]
         path = item["path"]
         
+        if not is_safe_path(path):
+            log.warning("安全检查未通过，跳过: %s", path)
+            continue
+        
         print_colored(f"    🧹 {name}...", Colors.YELLOW)
+        log.info("开始清理: %s (%s)", name, path)
+        
+        cleaned = 0
         
         if name in ("Windows更新缓存", "Delivery优化文件"):
-            # 尝试停止服务后再清理
+            service_stopped = False
             if IS_WINDOWS:
                 try:
-                    subprocess.run(["net", "stop", "wuauserv"], capture_output=True, timeout=10)
-                    time.sleep(0.5)
-                except:
-                    pass
+                    result = subprocess.run(
+                        ["net", "stop", "wuauserv"],
+                        capture_output=True, timeout=10, text=True
+                    )
+                    service_stopped = result.returncode == 0
+                    if service_stopped:
+                        time.sleep(0.5)
+                    else:
+                        log.warning("无法停止 wuauserv: %s", result.stderr)
+                except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                    log.warning("停止服务异常: %s", e)
             
             cleaned = engine.clean_folder(path)
             
-            if IS_WINDOWS:
+            if IS_WINDOWS and service_stopped:
                 try:
-                    subprocess.run(["net", "start", "wuauserv"], capture_output=True, timeout=10)
-                except:
-                    pass
+                    subprocess.run(
+                        ["net", "start", "wuauserv"],
+                        capture_output=True, timeout=10
+                    )
+                    log.info("wuauserv 已重启")
+                except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                    log.error("重启 wuauserv 失败: %s", e)
+                    print_colored("    ⚠️  wuauserv 重启失败，请手动检查", Colors.RED)
         elif "缩略图" in name:
-            # 只清理 thumbcache_* 文件
             cleaned = engine.clean_pattern(path, "thumbcache_*")
         elif "NVIDIA" in name or "着色器" in name:
             cleaned = engine.clean_folder(path)
@@ -303,15 +497,13 @@ def clean_c_drive(engine, items):
 
 # ─── D盘清理项 ──────────────────────────────────────────
 
-def scan_d_drive(engine):
+def scan_d_drive(engine: CleanupEngine) -> None:
     """扫描D盘可清理项"""
     if IS_WINDOWS:
         d_root = "D:\\"
     else:
-        # Linux 测试模式 - 使用测试目录
         d_root = "/tmp/d_drive_test/"
         os.makedirs(d_root, exist_ok=True)
-        # 创建一些测试文件
         test_dirs = ["Temp", "Logs", "Cache", "Backup"]
         for td in test_dirs:
             tp = os.path.join(d_root, td)
@@ -319,7 +511,6 @@ def scan_d_drive(engine):
             for i in range(3):
                 with open(os.path.join(tp, f"test_{i}.tmp"), "w") as f:
                     f.write("x" * 1024 * (i + 1) * 100)
-        # 创建一些旧文件
         old_file = os.path.join(d_root, "old_log.log")
         with open(old_file, "w") as f:
             f.write("old log content" * 1000)
@@ -356,7 +547,7 @@ def scan_d_drive(engine):
             print_colored(f"    ✓ [D盘]回收站: {size_str(size)}", Colors.GRAY)
     
     # Thumbs.db
-    print_colored("    ...扫描 Thumbs.db", Colors.DARKGRAY if hasattr(Colors, 'DARKGRAY') else Colors.GRAY)
+    print_colored("    ...扫描 Thumbs.db", Colors.GRAY)
     thumbs_size = 0
     thumbs_count = 0
     try:
@@ -364,9 +555,9 @@ def scan_d_drive(engine):
             try:
                 thumbs_size += f.stat().st_size
                 thumbs_count += 1
-            except:
+            except OSError:
                 pass
-    except:
+    except OSError:
         pass
     if thumbs_size > 0:
         engine.add_result("[D盘]Thumbs.db文件", d_root, thumbs_size, "D")
@@ -380,9 +571,9 @@ def scan_d_drive(engine):
             try:
                 ini_size += f.stat().st_size
                 ini_count += 1
-            except:
+            except OSError:
                 pass
-    except:
+    except OSError:
         pass
     if ini_size > 0:
         engine.add_result("[D盘]Desktop.ini文件", d_root, ini_size, "D")
@@ -431,9 +622,9 @@ def scan_d_drive(engine):
                     if f.is_file() and f.stat().st_mtime < cutoff:
                         old_size += f.stat().st_size
                         old_count += 1
-                except:
+                except OSError:
                     pass
-        except:
+        except OSError:
             pass
     if old_size > 0:
         engine.add_result("[D盘]旧临时文件(30天+)", d_root, old_size, "D")
@@ -441,51 +632,64 @@ def scan_d_drive(engine):
     
     # 包管理器缓存
     if IS_WINDOWS:
+        user_profile = get_user_profile()
+        local_appdata = get_local_appdata()
         pkg_caches = [
-            os.path.join(local_appdata, "pip", "cache"),
-            os.path.join(local_appdata, "Yarn", "Cache"),
-            os.path.join(os.environ.get("USERPROFILE", ""), ".nuget", "packages"),
+            ("pip 缓存", os.path.join(local_appdata, "pip", "cache")),
+            ("Yarn 缓存", os.path.join(local_appdata, "Yarn", "Cache")),
+            ("NuGet 缓存", os.path.join(user_profile, ".nuget", "packages")),
+            ("Cargo 缓存", os.path.join(user_profile, ".cargo", "registry")),
         ]
     else:
         pkg_caches = [
-            os.path.expanduser("~/.cache/pip"),
+            ("pip 缓存", os.path.expanduser("~/.cache/pip")),
         ]
     
-    for pc in pkg_caches:
+    for pkg_name, pc in pkg_caches:
         if os.path.isdir(pc):
             size = folder_size(pc)
             if size > 0:
-                engine.add_result("[缓存]包管理器", pc, size, "D" if not IS_WINDOWS else "C")
-                print_colored(f"    ✓ [缓存]包管理器: {size_str(size)}", Colors.GRAY)
+                drive = "C" if IS_WINDOWS else "D"
+                engine.add_result(f"[缓存]{pkg_name}", pc, size, drive)
+                print_colored(f"    ✓ [缓存]{pkg_name}: {size_str(size)}", Colors.GRAY)
 
-def clean_d_drive(engine, items):
+def clean_d_drive(engine: CleanupEngine, items: list[dict]) -> None:
     """执行D盘清理"""
     for item in items:
         name = item["name"]
         path = item["path"]
         
         print_colored(f"    🧹 {name}...", Colors.YELLOW)
+        log.info("开始清理 D盘项: %s (%s)", name, path)
+        
+        cleaned = 0
         
         if "Thumbs.db" in name:
-            cleaned = 0
             base = Path(path)
             for f in base.rglob("Thumbs.db"):
                 try:
-                    cleaned += f.stat().st_size
+                    size = f.stat().st_size
                     f.unlink()
+                    cleaned += size
                     engine.total_files += 1
-                except:
+                    engine.deleted_log.append(str(f))
+                    log.info("已删除: %s", f)
+                except OSError as e:
                     engine.errors += 1
+                    log.warning("删除失败: %s - %s", f, e)
         elif "Desktop.ini" in name:
-            cleaned = 0
             base = Path(path)
             for f in base.rglob("desktop.ini"):
                 try:
-                    cleaned += f.stat().st_size
+                    size = f.stat().st_size
                     f.unlink()
+                    cleaned += size
                     engine.total_files += 1
-                except:
+                    engine.deleted_log.append(str(f))
+                    log.info("已删除: %s", f)
+                except OSError as e:
                     engine.errors += 1
+                    log.warning("删除失败: %s - %s", f, e)
         elif "旧临时文件" in name:
             cleaned = engine.clean_old_files(path, ["*.log", "*.tmp", "*.bak", "*.old"], 30)
         elif "回收站" in name:
@@ -497,10 +701,10 @@ def clean_d_drive(engine, items):
         item["status"] = "done"
         item["cleaned"] = cleaned
 
-# ─── D盘深度分析 ─────────────────────────────────────────
+# ─── D盘深度分析 (改进：哈希去重) ───────────────────────
 
-def d_drive_deep_analysis():
-    """D盘大文件分析"""
+def d_drive_deep_analysis() -> None:
+    """D盘大文件分析（含哈希精确去重）"""
     d_root = "D:\\" if IS_WINDOWS else "/tmp/d_drive_test/"
     
     print()
@@ -527,7 +731,7 @@ def d_drive_deep_analysis():
                         large_files.append((str(f), size))
             except (PermissionError, OSError):
                 continue
-    except:
+    except OSError:
         pass
     
     large_files.sort(key=lambda x: x[1], reverse=True)
@@ -558,7 +762,7 @@ def d_drive_deep_analysis():
                         empty_dirs.append(str(d))
             except (PermissionError, OSError):
                 continue
-    except:
+    except OSError:
         pass
     
     if empty_dirs:
@@ -571,27 +775,43 @@ def d_drive_deep_analysis():
     else:
         print_colored("    未找到空目录", Colors.GRAY)
     
-    # 重复文件检测
-    print_colored("\n  🔄 扫描重复文件...", Colors.YELLOW)
-    size_groups = {}
+    # 改进的重复文件检测：先按大小分组，再用 MD5 精确比对
+    print_colored("\n  🔄 扫描重复文件（精确哈希比对）...", Colors.YELLOW)
+    size_groups: dict[int, list[str]] = defaultdict(list)
+    
     try:
         for f in Path(d_root).rglob("*"):
             try:
                 if f.is_file() and f.stat().st_size > 1024 * 1024:  # >1MB
-                    sz = f.stat().st_size
-                    size_groups.setdefault(sz, []).append(str(f))
-            except:
+                    size_groups[f.stat().st_size].append(str(f))
+            except OSError:
                 continue
-    except:
+    except OSError:
         pass
     
-    duplicates = {k: v for k, v in size_groups.items() if len(v) > 1}
-    if duplicates:
-        print_colored(f"  🔄 发现 {len(duplicates)} 组可能的重复文件:", Colors.WHITE)
-        for sz, files in sorted(duplicates.items(), key=lambda x: x[0], reverse=True)[:10]:
-            print_colored(f"    {size_str(sz)}:", Colors.YELLOW)
-            for f in files[:5]:
-                display = f.replace(d_root, "")
+    # 对同大小文件计算哈希
+    true_duplicates: dict[str, list[str]] = defaultdict(list)
+    duplicate_count = 0
+    
+    for sz, files in size_groups.items():
+        if len(files) < 2:
+            continue
+        for fpath in files:
+            h = file_hash(fpath)
+            if h:
+                true_duplicates[h].append(fpath)
+    
+    # 过滤出真正的重复文件（哈希相同且数量>1）
+    real_dupes = {h: paths for h, paths in true_duplicates.items() if len(paths) > 1}
+    duplicate_count = len(real_dupes)
+    
+    if real_dupes:
+        print_colored(f"  🔄 发现 {duplicate_count} 组重复文件（MD5 精确匹配）:", Colors.WHITE)
+        for h, paths in sorted(real_dupes.items(), key=lambda x: len(x[1]), reverse=True)[:10]:
+            sz = os.path.getsize(paths[0])
+            print_colored(f"    {size_str(sz)} ({len(paths)} 个文件):", Colors.YELLOW)
+            for fp in paths[:5]:
+                display = fp.replace(d_root, "")
                 if len(display) > 50:
                     display = "..." + display[-47:]
                 print_colored(f"      - {display}", Colors.GRAY)
@@ -603,7 +823,7 @@ def d_drive_deep_analysis():
 
 # ─── 系统优化 ────────────────────────────────────────────
 
-def system_optimization():
+def system_optimization() -> None:
     """系统优化功能"""
     print()
     print_colored("╔══════════════════════════════════════════════════════╗", Colors.BLUE)
@@ -624,43 +844,63 @@ def system_optimization():
     print()
     
     choice = input("  请选择: ").strip()
+    log.info("系统优化选择: %s", choice)
     
     if choice == "1":
         print_colored("\n  🔧 清理DNS缓存...", Colors.YELLOW)
-        if IS_WINDOWS:
-            subprocess.run(["ipconfig", "/flushdns"], capture_output=True)
-        else:
-            subprocess.run(["sudo", "systemd-resolve", "--flush-caches"], capture_output=True)
-        print_colored("  ✅ DNS缓存已清理", Colors.GREEN)
+        try:
+            if IS_WINDOWS:
+                subprocess.run(["ipconfig", "/flushdns"], capture_output=True, timeout=10)
+            else:
+                subprocess.run(["sudo", "systemd-resolve", "--flush-caches"], capture_output=True, timeout=10)
+            print_colored("  ✅ DNS缓存已清理", Colors.GREEN)
+            log.info("DNS缓存已清理")
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            print_colored(f"  ❌ DNS清理失败: {e}", Colors.RED)
+            log.error("DNS清理失败: %s", e)
     
     elif choice == "2":
         print_colored("\n  🔧 清理字体缓存...", Colors.YELLOW)
-        if IS_WINDOWS:
-            subprocess.run(["net", "stop", "FontCache"], capture_output=True)
-            local_appdata = get_local_appdata()
-            fc_path = os.path.join(local_appdata, "FontCache")
-            if os.path.isdir(fc_path):
-                for f in Path(fc_path).glob("*"):
-                    try:
-                        if f.is_file():
-                            f.unlink()
-                    except:
-                        pass
-            subprocess.run(["net", "start", "FontCache"], capture_output=True)
-        print_colored("  ✅ 字体缓存已清理", Colors.GREEN)
+        try:
+            if IS_WINDOWS:
+                subprocess.run(["net", "stop", "FontCache"], capture_output=True, timeout=10)
+                local_appdata = get_local_appdata()
+                fc_path = os.path.join(local_appdata, "FontCache")
+                if os.path.isdir(fc_path):
+                    for f in Path(fc_path).glob("*"):
+                        try:
+                            if f.is_file():
+                                f.unlink()
+                        except OSError:
+                            pass
+                subprocess.run(["net", "start", "FontCache"], capture_output=True, timeout=10)
+            print_colored("  ✅ 字体缓存已清理", Colors.GREEN)
+            log.info("字体缓存已清理")
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            print_colored(f"  ❌ 字体缓存清理失败: {e}", Colors.RED)
+            log.error("字体缓存清理失败: %s", e)
     
     elif choice == "3":
         print_colored("\n  🔧 运行磁盘清理...", Colors.YELLOW)
         if IS_WINDOWS:
-            subprocess.Popen(["cleanmgr", "/sagerun:1"])
-            print_colored("  ✅ 磁盘清理已启动", Colors.GREEN)
+            try:
+                subprocess.Popen(["cleanmgr", "/sagerun:1"])
+                print_colored("  ✅ 磁盘清理已启动", Colors.GREEN)
+            except FileNotFoundError:
+                print_colored("  ❌ cleanmgr 不可用", Colors.RED)
         else:
             print_colored("  ⚠ 仅Windows支持", Colors.YELLOW)
     
     elif choice == "4":
         print_colored("\n  🔧 WinSxS 组件清理 (可能需要几分钟)...", Colors.YELLOW)
         if IS_WINDOWS:
-            subprocess.run(["DISM", "/Online", "/Cleanup-Image", "/StartComponentCleanup"], capture_output=False)
+            try:
+                subprocess.run(
+                    ["DISM", "/Online", "/Cleanup-Image", "/StartComponentCleanup"],
+                    capture_output=False, timeout=600
+                )
+            except subprocess.TimeoutExpired:
+                print_colored("  ⚠ DISM 执行超时", Colors.YELLOW)
         else:
             print_colored("  ⚠ 仅Windows支持", Colors.YELLOW)
     
@@ -668,7 +908,7 @@ def system_optimization():
 
 # ─── 主界面 ──────────────────────────────────────────────
 
-def show_menu(engine):
+def show_menu(engine: CleanupEngine) -> None:
     """显示主菜单"""
     print()
     admin = is_admin()
@@ -694,10 +934,11 @@ def show_menu(engine):
     print_colored("  [3] 📂 自定义选择清理", Colors.WHITE)
     print_colored("  [4] 🔬 D盘深度分析", Colors.MAGENTA)
     print_colored("  [5] ⚙️  系统优化", Colors.BLUE)
-    print_colored("  [6] 🚪 退出", Colors.GRAY)
+    print_colored("  [6] 📋 查看清理日志", Colors.GRAY)
+    print_colored("  [7] 🚪 退出", Colors.GRAY)
     print()
 
-def run_scan(engine):
+def run_scan(engine: CleanupEngine) -> int:
     """扫描所有可清理项"""
     engine.results.clear()
     
@@ -707,36 +948,39 @@ def run_scan(engine):
     print_colored("╚══════════════════════════════════════════════════════╝", Colors.CYAN)
     
     scan_c_drive(engine)
+    scan_browser_cache(engine)  # 新增：浏览器缓存
     scan_d_drive(engine)
     
     total_size = sum(r["size"] for r in engine.results)
     
-    # 磁盘空间
     print()
     print_colored("  💾 磁盘空间:", Colors.WHITE)
-    c_free = drive_free_space("C")
-    if c_free >= 0:
-        try:
-            _, used, free = shutil.disk_usage("C:\\" if IS_WINDOWS else "/")
-            total = used + free
-            print_colored(f"    C盘: 已用 {size_str(used)} / 总共 {size_str(total)} / 剩余 {size_str(free)}", Colors.GRAY)
-        except:
-            pass
+    try:
+        if IS_WINDOWS:
+            _, used, free = shutil.disk_usage("C:\\")
+        else:
+            _, used, free = shutil.disk_usage("/")
+        total = used + free
+        print_colored(f"    C盘: 已用 {size_str(used)} / 总共 {size_str(total)} / 剩余 {size_str(free)}", Colors.GRAY)
+    except OSError:
+        pass
     
     if IS_WINDOWS:
         try:
             _, used, free = shutil.disk_usage("D:\\")
             total = used + free
             print_colored(f"    D盘: 已用 {size_str(used)} / 总共 {size_str(total)} / 剩余 {size_str(free)}", Colors.GRAY)
-        except:
+        except OSError:
             pass
     
     print()
     print_colored(f"  🗑️  可清理: {colored(size_str(total_size), Colors.GREEN)} 共 {len(engine.results)} 项", Colors.GREEN)
     
+    log.info("扫描完成: %d 项, 共 %s", len(engine.results), size_str(total_size))
+    
     return total_size
 
-def run_cleanup(engine, items=None):
+def run_cleanup(engine: CleanupEngine, items: Optional[list[dict]] = None) -> None:
     """执行清理"""
     if items is None:
         items = engine.results
@@ -753,10 +997,13 @@ def run_cleanup(engine, items=None):
     engine.total_files = 0
     engine.errors = 0
     
-    # 分离C盘和D盘项
-    c_items = [i for i in items if i["drive"] == "C"]
+    # 分离浏览器、C盘和D盘项
+    browser_items = [i for i in items if "缓存" in i["name"] and any(b in i["name"] for b in ["Chrome", "Edge", "Firefox"])]
+    c_items = [i for i in items if i["drive"] == "C" and i not in browser_items]
     d_items = [i for i in items if i["drive"] == "D"]
     
+    if browser_items:
+        clean_browser_cache(engine, browser_items)
     if c_items:
         clean_c_drive(engine, c_items)
     if d_items:
@@ -770,19 +1017,68 @@ def run_cleanup(engine, items=None):
     print_colored(f"  💾 释放空间: {colored(size_str(engine.total_cleaned), Colors.GREEN)}", Colors.WHITE)
     if engine.errors > 0:
         print_colored(f"  ⚠️  跳过文件: {engine.errors} 个 (权限不足或被占用)", Colors.YELLOW)
+    print_colored(f"  📋 操作日志: {LOG_FILE}", Colors.GRAY)
     print_colored("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.GREEN)
+    
+    log.info("清理完成: %d 文件, 释放 %s, %d 错误", engine.total_files, size_str(engine.total_cleaned), engine.errors)
+
+def show_log() -> None:
+    """显示清理日志"""
+    print()
+    print_colored("╔══════════════════════════════════════════════════════╗", Colors.GRAY)
+    print_colored("║           📋  清理日志                              ║", Colors.GRAY)
+    print_colored("╚══════════════════════════════════════════════════════╝", Colors.GRAY)
+    print()
+    
+    if not os.path.exists(LOG_FILE):
+        print_colored("  暂无日志记录", Colors.GRAY)
+        input("\n  按回车返回...")
+        return
+    
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        if not lines:
+            print_colored("  日志为空", Colors.GRAY)
+        else:
+            # 显示最后 50 行
+            display_lines = lines[-50:]
+            for line in display_lines:
+                line = line.rstrip()
+                if "[ERROR]" in line:
+                    print_colored(f"  {line}", Colors.RED)
+                elif "[WARNING]" in line:
+                    print_colored(f"  {line}", Colors.YELLOW)
+                elif "已删除" in line:
+                    print_colored(f"  {line}", Colors.GRAY)
+                else:
+                    print_colored(f"  {line}", Colors.WHITE)
+            
+            if len(lines) > 50:
+                print_colored(f"\n  ... (共 {len(lines)} 行，显示最后 50 行)", Colors.GRAY)
+    except OSError as e:
+        print_colored(f"  读取日志失败: {e}", Colors.RED)
+    
+    print()
+    input("  按回车返回主菜单...")
 
 # ─── 主入口 ──────────────────────────────────────────────
 
-def main():
+def main() -> None:
     engine = CleanupEngine()
+    
+    log.info("=" * 50)
+    log.info("清理工具启动 v2.1")
+    log.info("系统: %s, 管理员: %s", sys.platform, is_admin())
     
     while True:
         os.system("cls" if IS_WINDOWS else "clear")
         banner()
         show_menu(engine)
         
-        choice = input("  请选择 (1-6): ").strip()
+        choice = input("  请选择 (1-7): ").strip()
+        log.info("用户选择: %s", choice)
         
         if choice == "1":
             run_scan(engine)
@@ -794,7 +1090,10 @@ def main():
                 print()
                 confirm = input("  确认清理? (y/n): ").strip().lower()
                 if confirm == "y":
+                    log.info("用户确认一键清理")
                     run_cleanup(engine)
+                else:
+                    log.info("用户取消清理")
             input("\n  按回车返回主菜单...")
         
         elif choice == "3":
@@ -816,6 +1115,7 @@ def main():
                         continue
                 
                 if selected:
+                    log.info("用户选择清理 %d 项", len(selected))
                     run_cleanup(engine, selected)
                 else:
                     print_colored("  ⚠ 未选择任何项目", Colors.YELLOW)
@@ -828,8 +1128,12 @@ def main():
             system_optimization()
         
         elif choice == "6":
+            show_log()
+        
+        elif choice == "7":
             print()
             print_colored("  👋 再见！", Colors.CYAN)
+            log.info("清理工具退出")
             time.sleep(0.5)
             break
         
