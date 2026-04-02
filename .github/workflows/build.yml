@@ -1,0 +1,57 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build EXE
+        run: |
+          python -m PyInstaller ^
+            --onefile ^
+            --name "Win11Cleanup" ^
+            --clean ^
+            --noconfirm ^
+            --console ^
+            win11_cleanup.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Win11Cleanup
+          path: dist/Win11Cleanup.exe
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Win11Cleanup.exe
+          generate_release_notes: true
+          body: |
+            ## 🧹 Win11 Cleanup Tool
+
+            ### 使用方法
+            1. 下载 `Win11Cleanup.exe`
+            2. 右键 → **以管理员身份运行**
+            3. 选择清理模式即可
+
+            ### 注意事项
+            - Windows 10/11 系统
+            - 建议以管理员权限运行（不提权也能用，部分项会跳过）
+            - 首次建议先扫描再清理
